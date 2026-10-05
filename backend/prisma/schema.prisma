@@ -1,0 +1,1003 @@
+// ---------------------------------------------------------------------------
+// AI Employee Intelligence Platform - data model
+//
+// Provider is `sqlite` for zero-dependency local development. The model below
+// is written to be portable to PostgreSQL:
+//   * no SQLite-specific column types
+//   * enum-like columns are Strings constrained by the TypeScript unions in
+//     `src/core/enums.ts` and validated with Zod at the API boundary
+//     (Prisma does not support native enums on SQLite)
+//   * all relations declare explicit `onDelete` behaviour
+//
+// Migration notes for PostgreSQL are documented in the root README.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================================================
+// Identity & organisation
+// ===========================================================================
+
+/// Authentication identity. Kept separate from `Employee` so that logins are
+/// not tied to an HRIS record and so a user can exist before onboarding.
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         String     @default("EMPLOYEE") // UserRole
+  status       String     @default("ACTIVE") // UserStatus
+  isActive     Boolean    @default(true)
+  avatarUrl    String?
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  deletedAt    DateTime?
+
+  employee            Employee?      @relation("UserEmployee")
+  managedRecords      Manager[]
+  refreshTokens       RefreshToken[]
+  surveyResponses     SurveyResponse[]
+  authoredSurveys     Survey[]
+  feedbackAuthored    Feedback[]     @relation("FeedbackAuthor")
+  aiConversations     AiConversation[]
+  ownedActionItems    ActionItem[]   @relation("ActionItemOwner")
+  assignedAlerts      Alert[]        @relation("AlertAssignee")
+  createdAlerts       Alert[]        @relation("AlertCreator")
+  generatedReports    Report[]       @relation("ReportGenerator")
+  aiUsageEvents       AiUsageEvent[]
+  pulseConfigUpdates  DailyPulseConfig[] @relation("PulseConfigUpdatedBy")
+
+  @@index([role])
+  @@index([status])
+}
+
+/// A person employed by the organisation, joined 1:1 to a login account.
+model Employee {
+  id             String     @id @default(cuid())
+  employeeNumber String     @unique
+  userId         String?    @unique
+  firstName      String
+  lastName       String
+  email          String     @unique
+  jobTitle       String?
+  phone          String?
+  location       String?
+  timezone       String?
+  employmentType String     @default("FULL_TIME") // EmploymentType
+  status         String     @default("ACTIVE") // EmployeeStatus
+  hireDate       DateTime?
+  terminationDate DateTime?
+  dateOfBirth    DateTime?
+  skills         String? // comma separated
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  deletedAt      DateTime?
+
+  user               User?              @relation("UserEmployee", fields: [userId], references: [id], onDelete: SetNull)
+  departmentId       String?
+  department         Department?        @relation("DepartmentMembers", fields: [departmentId], references: [id], onDelete: SetNull)
+  teamId             String?
+  team               Team?              @relation("EmployeeTeam", fields: [teamId], references: [id], onDelete: SetNull)
+  headedDepartments   Department[]       @relation("DepartmentHead")
+  directReports      Manager[]          @relation("DirectReports")
+  feedbackReceived   Feedback[]         @relation("FeedbackRecipient")
+  checkIns           EmployeeCheckIn[]
+  engagementScores   EngagementScore[]
+  riskPredictions    RiskPrediction[]
+  alerts             Alert[]
+  surveyResponses    SurveyResponse[]
+  sentimentAnalyses  SentimentAnalysis[]
+  activitySignals    EmployeeActivitySignal[]
+  factorResults      EngagementFactorResult[]
+  dailyResponses     DailyQuestionResponse[]
+  dailyAnswers       DailyQuestionAnswer[]
+  writtenFeedback    EmployeeFeedback[]
+  feedbackHistory    FeedbackHistory[]
+  dailyScores        DailyEngagementScore[]
+
+  @@index([departmentId])
+  @@index([teamId])
+  @@index([status])
+}
+
+/// Organisational unit. Self-referencing to model a reporting hierarchy.
+model Department {
+  id          String    @id @default(cuid())
+  name        String
+  code        String    @unique
+  description String?
+  parentId    String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  parent     Department?  @relation("DepartmentTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children   Department[] @relation("DepartmentTree")
+  headId     String?
+  head       Employee?    @relation("DepartmentHead", fields: [headId], references: [id], onDelete: SetNull)
+  employees  Employee[]   @relation("DepartmentMembers")
+  managers   Manager[]    @relation("DepartmentManager")
+  teams      Team[]       @relation("DepartmentTeams")
+  surveys    Survey[]
+
+  @@index([parentId])
+}
+
+/// Management assignment: who manages whom, or who heads a department.
+/// A user's management scope is derived from these rows, which is what the
+/// RBAC layer uses to scope Manager-level data access.
+model Manager {
+  id            String    @id @default(cuid())
+  managerUserId String
+  employeeId    String?
+  departmentId  String?
+  /// Optional team this management record grants access to. When null the
+  /// record grants the whole department.
+  teamId        String?
+  scope         String    @default("DIRECT_REPORT") // ManagerScope
+  isPrimary     Boolean   @default(true)
+  startedAt     DateTime  @default(now())
+  endedAt       DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  managerUser User       @relation(fields: [managerUserId], references: [id], onDelete: Cascade)
+  employee    Employee?  @relation("DirectReports", fields: [employeeId], references: [id], onDelete: Cascade)
+  department  Department? @relation("DepartmentManager", fields: [departmentId], references: [id], onDelete: Cascade)
+  team        Team?      @relation("TeamManager", fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([managerUserId])
+  @@index([employeeId])
+  @@index([departmentId])
+  @@index([teamId])
+}
+
+/// Rotating refresh tokens, stored hashed so a database leak cannot be
+/// replayed as a valid session.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ipAddress String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ===========================================================================
+// Surveys
+// ===========================================================================
+
+model Survey {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  type        String    @default("PULSE") // SurveyType
+  status      String    @default("DRAFT") // SurveyStatus
+  audience    String    @default("ALL") // SurveyAudience
+  isAnonymous Boolean   @default(false)
+  opensAt     DateTime?
+  closesAt    DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  publishedAt DateTime?
+  createdById String?
+  deletedAt   DateTime?
+
+  createdBy   User?             @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  departmentId String?
+  department  Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  questions   SurveyQuestion[]
+  responses   SurveyResponse[]
+
+  @@index([status])
+  @@index([departmentId])
+}
+
+model SurveyQuestion {
+  id          String   @id @default(cuid())
+  surveyId    String
+  prompt      String
+  description String?
+  type        String   @default("LIKERT_5") // QuestionType
+  isRequired  Boolean  @default(true)
+  options     String? // pipe delimited, choice questions only
+  order       Int      @default(0)
+  weight      Float    @default(1)
+
+  survey  Survey           @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  answers SurveyAnswer[]
+
+  @@index([surveyId, order])
+}
+
+model SurveyResponse {
+  id           String    @id @default(cuid())
+  surveyId     String
+  respondentId String?
+  employeeId   String?
+  /// HMAC of the respondent's user id, used only to let an anonymous submitter
+  /// find and update their own response. It is not reversible to a person, is
+  /// null for attributed responses, and is cleared if anonymity is ever revoked.
+  anonymousOwnerHash String?
+  status       String    @default("IN_PROGRESS") // ResponseStatus
+  startedAt    DateTime  @default(now())
+  submittedAt  DateTime?
+  sentiment    String? // SentimentLabel, populated by the AI pipeline
+  sentimentScore Float?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  survey     Survey         @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  respondent User?          @relation(fields: [respondentId], references: [id], onDelete: SetNull)
+  employee   Employee?      @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  answers    SurveyAnswer[]
+  sentimentAnalyses SentimentAnalysis[]
+
+  @@index([surveyId])
+  @@index([respondentId])
+  @@index([employeeId])
+  @@index([anonymousOwnerHash])
+}
+
+model SurveyAnswer {
+  id         String   @id @default(cuid())
+  responseId String
+  questionId String
+  valueText  String?
+  valueNumber Float?
+  createdAt  DateTime @default(now())
+
+  response SurveyResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  question SurveyQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([responseId])
+  @@index([questionId])
+}
+
+// ===========================================================================
+// Feedback
+// ===========================================================================
+
+/// Lightweight, periodic wellbeing pulse. Distinct from `Feedback` because a
+/// check-in is a recurring structured signal (mood, energy, workload) while
+/// feedback is an authored, free-form submission.
+model EmployeeCheckIn {
+  id         String    @id @default(cuid())
+  employeeId String
+  teamId     String?
+  period     String // YYYY-MM, one check-in per employee per period
+  mood       Int // 1-5
+  energy     Int? // 1-5
+  workload   Int? // 1-5
+  note       String?
+  sentiment  String? // SentimentLabel, populated by the AI pipeline
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  team     Team?    @relation(fields: [teamId], references: [id], onDelete: SetNull)
+
+  @@unique([employeeId, period])
+  @@index([period])
+  @@index([teamId])
+}model Feedback {
+  id           String    @id @default(cuid())
+  title        String?
+  content      String
+  category     String    @default("GENERAL") // FeedbackCategory
+  channel      String    @default("PORTAL") // FeedbackChannel
+  status       String    @default("SUBMITTED") // FeedbackStatus
+  visibility   String    @default("HR_ONLY") // FeedbackVisibility
+  isAnonymous  Boolean   @default(false)
+  sentiment    String? // SentimentLabel
+  sentimentScore Float?
+  aiSummary    String?
+  authorId     String?
+  recipientId  String?
+  acknowledgedAt DateTime?
+  resolvedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  author    User?     @relation("FeedbackAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  recipient Employee? @relation("FeedbackRecipient", fields: [recipientId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([category])
+  @@index([authorId])
+  @@index([recipientId])
+}
+
+// ===========================================================================
+// Engagement & risk
+// ===========================================================================
+
+/// A time-bucketed engagement measurement. `period` is a `YYYY-MM` string so
+/// history can be stored and aggregated without a date dimension table.
+model EngagementScore {
+  id             String   @id @default(cuid())
+  employeeId     String
+  period         String
+  overallScore   Float
+  eNps           Float?
+  workLifeBalance Float?
+  growthOpportunity Float?
+  managerEffectiveness Float?
+  workloadBalance Float?
+  source         String   @default("SURVEY") // ScoreSource
+  confidence     Float?
+  /// Identifier for the scoring algorithm that produced this row, so scores
+  /// from different algorithm versions can be told apart and re-derived.
+  method         String? // e.g. AI_INTELLIGENCE_V1
+  calculatedAt   DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, period])
+  @@index([period])
+}
+
+/// Output of the attrition-risk model, versioned by `modelVersion` so scores
+/// from different model releases can be compared and audited.
+model RiskPrediction {
+  id            String   @id @default(cuid())
+  employeeId    String
+  riskScore     Float
+  riskLevel     String // RiskLevel
+  factors       String? // JSON encoded factor breakdown
+  modelVersion  String
+  confidence    Float?
+  horizonDays   Int      @default(90)
+  explanation   String?
+  predictedAt   DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  employee Employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  alerts   Alert[]
+
+  @@index([employeeId])
+  @@index([riskLevel])
+  @@index([predictedAt])
+}
+
+model Alert {
+  id                String    @id @default(cuid())
+  type              String // AlertType
+  severity          String    @default("INFO") // AlertSeverity
+  title             String
+  message           String
+  status            String    @default("OPEN") // AlertStatus
+  employeeId        String?
+  riskPredictionId  String?
+  assignedToId      String?
+  createdById       String?
+  triggeredAt       DateTime  @default(now())
+  acknowledgedAt    DateTime?
+  resolvedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  employee       Employee?       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  riskPrediction RiskPrediction? @relation(fields: [riskPredictionId], references: [id], onDelete: SetNull)
+  assignedTo     User?           @relation("AlertAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  createdBy      User?           @relation("AlertCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  actionItems    ActionItem[]
+
+  @@index([status])
+  @@index([severity])
+  @@index([employeeId])
+}
+
+model ActionItem {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  status      String    @default("OPEN") // ActionItemStatus
+  priority    String    @default("MEDIUM") // Priority
+  ownerId     String?
+  alertId     String?
+  dueDate     DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  owner User?  @relation("ActionItemOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  alert Alert? @relation(fields: [alertId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([ownerId])
+  @@index([alertId])
+}
+
+// ===========================================================================
+// Reports
+// ===========================================================================
+
+model Report {
+  id           String    @id @default(cuid())
+  title        String
+  description  String?
+  type         String // ReportType
+  format       String    @default("JSON") // ReportFormat
+  status       String    @default("PENDING") // ReportStatus
+  parameters   String? // JSON encoded filter set used to build the report
+  storageKey   String?
+  generatedById String?
+  errorMessage String?
+  scheduledFor DateTime?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  generatedBy User? @relation("ReportGenerator", fields: [generatedById], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+}
+
+// ===========================================================================
+// System configuration
+// ===========================================================================
+
+/// Key/value store for runtime-tunable settings, most importantly the privacy
+/// rules that govern anonymous feedback, reporting thresholds and what a
+/// manager may see. Values are JSON so a setting can change type without a
+/// migration. Missing keys fall back to the defaults in
+/// `src/modules/settings/settings.defaults.ts`; the table stays empty until an
+/// administrator explicitly saves a value.
+model SystemSetting {
+  key         String   @id
+  value       String // JSON encoded
+  description String?
+  updatedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([updatedById])
+}
+
+// ===========================================================================
+// AI
+// ===========================================================================
+
+model AiConversation {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String   @default("New conversation")
+  kind      String   @default("CHAT") // ConversationKind
+  provider  String
+  model     String
+  context   String? // JSON encoded context handles, e.g. {"employeeId":"..."}
+  isArchived Boolean @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages    AiMessage[]
+  usageEvents AiUsageEvent[]
+
+  @@index([userId])
+  @@index([kind])
+  @@index([updatedAt])
+}
+
+model AiMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  role           String // MessageRole: user | assistant | system
+  content        String
+  provider       String?
+  model          String?
+  promptTokens   Int?
+  completionTokens Int?
+  totalTokens    Int?
+  latencyMs      Int?
+  error          String?
+  createdAt      DateTime @default(now())
+
+  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+}
+
+/// Token/cost ledger, written by the AI provider adapter.
+model AiUsageEvent {
+  id             String   @id @default(cuid())
+  userId         String?
+  conversationId String?
+  provider       String
+  model          String
+  feature        String?
+  promptTokens   Int      @default(0)
+  completionTokens Int    @default(0)
+  totalTokens    Int      @default(0)
+  latencyMs      Int?
+  success        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  user         User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  conversation AiConversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([conversationId])
+  @@index([createdAt])
+}
+
+// ===========================================================================
+// AI Intelligence
+//
+// The NLP output tables are written once per analysed text and are immutable
+// apart from a re-analysis, so every sentiment figure in the product can be
+// traced to the record and the analyser that produced it.
+// ===========================================================================
+
+/// One classified piece of text. `method` records whether an AI model or the
+/// deterministic lexicon produced the label, so a reader is never misled about
+/// how much to trust it.
+model SentimentAnalysis {
+  id            String   @id @default(cuid())
+  sourceType    String   // SentimentSource: FEEDBACK | SURVEY_RESPONSE | ...
+  sourceId      String
+  /// Null for text that cannot be attributed to a person, e.g. anonymous
+  /// feedback. Aggregates are still computed, just never traced to an employee.
+  employeeId    String?
+  /// YYYY-MM bucket used by the trends APIs.
+  period        String
+  label         String   // SentimentClass: POSITIVE | NEUTRAL | NEGATIVE
+  /// Normalised polarity in [-1, 1]. Carries the nuance the label cannot.
+  score         Float
+  /// Model confidence in the label, in [0, 1].
+  confidence    Float?
+  method        String   // SentimentMethod: AI | LEXICON | UNSCORED
+  provider      String?
+  model         String?
+  /// Short, non-sensitive extract of the analysed text, for review screens.
+  excerpt       String?
+  analyzedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  employee Employee?         @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  response SurveyResponse?   @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  responseId String?
+  themes    ThemeDetection[]
+
+  @@unique([sourceType, sourceId])
+  @@index([employeeId, period])
+  @@index([period, label])
+  @@index([sourceType])
+}
+
+/// A theme found in one analysed text. Evidence is the matched terms, which
+/// makes a theme claim auditable rather than an opaque model assertion.
+model ThemeDetection {
+  id          String   @id @default(cuid())
+  analysisId  String
+  theme       String   // EngagementTheme
+  confidence  Float    @default(0)
+  evidence    String?  // pipe delimited matched terms
+  createdAt   DateTime @default(now())
+
+  analysis SentimentAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+
+  @@unique([analysisId, theme])
+  @@index([theme])
+}
+
+/// Configurable weight for one engagement factor. Code defaults apply when no
+/// row exists, so a fresh install scores correctly without seeded data; the
+/// table only records deliberate overrides.
+model EngagementFactorConfig {
+  key         String   @id // EngagementFactorKey
+  weight      Float    @default(0)
+  enabled     Boolean  @default(true)
+  description String?
+  updatedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([updatedById])
+}
+
+/// The audit trail behind a single engagement score: what each factor saw, how
+/// it was normalised, and how much it moved the total. Without this an
+/// engagement number is not defensible to the person it is about.
+model EngagementFactorResult {
+  id              String   @id @default(cuid())
+  employeeId      String
+  period          String
+  factorKey       String   // EngagementFactorKey
+  /// Raw measurement as collected, before normalisation. Null when the factor
+  /// had no data for the period: recording 0 would be indistinguishable from a
+  /// genuine measurement of zero.
+  rawValue        Float?
+  /// Measurement mapped onto [0, 100]. Null when the factor had no data.
+  normalizedScore Float?
+  /// Weight applied, copied from the config so history is self-contained.
+  weight          Float
+  /// Points this factor contributed to the overall score.
+  contribution    Float
+  /// False when the factor is switched off in the current configuration.
+  enabled         Boolean  @default(true)
+  /// Records behind the factor, used for the confidence calculation.
+  sampleSize      Int      @default(0)
+  /// Human-readable justification shown next to the number in the UI.
+  explanation     String?
+  calculatedAt    DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, period, factorKey])
+  @@index([period])
+}
+
+/// A coarse, opt-in activity measure. Only `APPROVED` rows influence engagement,
+/// so an organisation cannot quietly feed unvetted data into someone's score.
+model EmployeeActivitySignal {
+  id           String   @id @default(cuid())
+  employeeId   String
+  period       String // YYYY-MM
+  signalKey    String   // ActivitySignalKey
+  value        Float
+  unit         String   @default("count")
+  source       String   @default("MANUAL") // system that reported the signal
+  approvalStatus String @default("PENDING") // ActivityApprovalStatus
+  approvedById String?
+  approvedAt   DateTime?
+  note         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, period, signalKey])
+  @@index([period, approvalStatus])
+}
+
+/// Pre-computed engagement and sentiment figures for one aggregation domain
+/// and period. Materialising these keeps the dashboard read path cheap and
+/// makes the privacy suppression decision auditable after the fact: a
+/// suppressed row stores the sample size, never a value.
+model EngagementDomainScore {
+  id          String   @id @default(cuid())
+  period      String // YYYY-MM
+  domain      String   // AnalyticsLevel: EMPLOYEE | TEAM | DEPARTMENT | ORGANISATION
+  /// employeeId, departmentId, or 'ALL' for the organisation.
+  domainKey   String
+  domainName  String
+  /// AnalyticsDimension: ENGAGEMENT, SENTIMENT_* or a theme.
+  dimension   String
+  /// [0, 100] for engagement, [0, 1] share for counts, [-1, 1] for polarity.
+  value       Float
+  sampleSize  Int      @default(0)
+  /// True when the group was below the privacy threshold; `value` is then 0
+  /// and must never be displayed.
+  suppressed  Boolean  @default(false)
+  calculatedAt DateTime @default(now())
+
+  @@unique([period, domain, domainKey, dimension])
+  @@index([period, domain, dimension])
+  @@index([domainKey])
+}
+
+// ===========================================================================
+// Daily employee feedback
+// ===========================================================================
+
+/// A sub-group of a department. The platform scopes manager access to teams, so
+/// this is what "their team" resolves to on every dashboard.
+model Team {
+  id           String    @id @default(cuid())
+  name         String
+  code         String    @unique
+  description  String?
+  departmentId String?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  department Department?  @relation("DepartmentTeams", fields: [departmentId], references: [id], onDelete: SetNull)
+  employees  Employee[]   @relation("EmployeeTeam")
+  managers   Manager[]    @relation("TeamManager")
+  checkIns   EmployeeCheckIn[]
+
+  @@index([departmentId])
+}
+
+/// Singleton-ish row controlling the daily pulse. Exactly one row is used
+/// (`id = "default"`); keeping it in the database rather than in code is what
+/// lets HR change the submission policy without a redeploy.
+model DailyPulseConfig {
+  id                String   @id @default("default")
+  /// Fixed at 5 by the product spec. Stored so the value is auditable, not
+  /// configurable: the whole scoring model is defined against five answers.
+  questionsPerDay   Int      @default(5)
+  /// When false, a second submission on the same UTC day is rejected. HR/Admin
+  /// can enable it for short windows (for example while onboarding a late
+  /// starter) without a deploy.
+  allowResubmission Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  /// Hour (0-23, UTC) the next day's questions become visible.
+  opensAtHour       Int      @default(0)
+  updatedById       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  updatedBy User? @relation("PulseConfigUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+}
+
+/// The five questions shown to every employee on one UTC day.
+///
+/// A set is written once, when the day is first opened, and then frozen: every
+/// employee who answers on that date sees the same five questions, and the
+/// wording stored against an answer is the wording that was actually asked.
+/// That is why questions live in their own rows rather than being edited in
+/// place - regenerating tomorrow's set must never rewrite today's history.
+///
+/// The unique constraint on `responseDate` is also what makes the set a
+/// singleton under concurrency: two employees opening the same day at the same
+/// moment race to create it, and exactly one wins.
+model DailyQuestionSet {
+  id           String   @id @default(cuid())
+  /// UTC midnight. One set per day.
+  responseDate DateTime @unique
+  /// QuestionSetSource: GEMINI when a configured model wrote them, BANK when the
+  /// curated fallback pool was used. Stored so an HR reader can tell a generated
+  /// question from a reviewed one, and so a Gemini outage is visible rather than
+  /// silently disguised as a normal day.
+  source       String   @default("BANK")
+  /// Provider and model that produced the set, when `source` is GEMINI.
+  model        String?
+  /// Why the fallback was used, or a note about the generation. Null on success.
+  note         String?
+  createdAt    DateTime @default(now())
+
+  questions DailyQuestion[]
+
+  @@index([responseDate])
+}
+
+/// One of the five questions HR configures for the daily pulse. Questions are
+/// versioned by row rather than edited in place, so a stored response always
+/// has the wording that was actually asked on the day it was given.
+///
+/// A row belongs to exactly one of two populations, distinguished by
+/// `questionSetId`:
+///
+///  - null: the curated pool HR maintains in Pulse Settings. These are never
+///    shown directly; the generator draws from them when building a daily set.
+///  - set: one of the five questions of a specific `DailyQuestionSet`, frozen
+///    with the day it was asked on.
+model DailyQuestion {
+  id          String   @id @default(cuid())
+  prompt      String
+  /// DailyAnswerType: RATING | YES_NO | MULTIPLE_CHOICE | SHORT_TEXT
+  answerType  String   @default("RATING")
+  /// JSON array of option labels; only read for MULTIPLE_CHOICE and YES_NO.
+  optionsJson String?
+  helpText    String?
+  /// Position in the five-question set, 1-5. Unique within a set.
+  position    Int
+  /// EngagementTheme this question probes, used to keep a generated day from
+  /// asking about workload five times. Null on hand-written pool rows.
+  theme       String?
+  /// Null for the curated pool; set for a question belonging to one day's set.
+  questionSetId String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  questionSet DailyQuestionSet?      @relation(fields: [questionSetId], references: [id], onDelete: Cascade)
+  responses   DailyQuestionResponse[]
+  answers     DailyQuestionAnswer[]
+
+  /// Scoped to the set rather than global: the same position is reused on every
+  /// day, which is the entire point of a rotating question set.
+  @@unique([questionSetId, position])
+  @@index([isActive])
+  @@index([questionSetId])
+}
+
+/// One employee's answer set for one day. The unique constraint on
+/// (employeeId, responseDate) is what makes duplicate submission impossible at
+/// the database level rather than only in application code.
+///
+/// This row is the submission anchor. The individual answers live in
+/// `DailyQuestionAnswer`; a row here therefore means "this employee answered
+/// today's pulse", regardless of how many questions were asked.
+model DailyQuestionResponse {
+  id           String   @id @default(cuid())
+  employeeId   String
+  /// The question this row is anchored to. With a full five-question set the
+  /// choice is arbitrary; it exists so the row is always related to a real
+  /// question, which keeps referential integrity meaningful.
+  questionId   String
+  /// UTC calendar day, stored as midnight so it can be compared with equality.
+  responseDate DateTime
+  /// Mean of that day's numeric answers, for cheap list views. Null when the
+  /// day's questions were all free text.
+  summaryValue Float?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  employee Employee               @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  question DailyQuestion           @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  answers  DailyQuestionAnswer[]
+
+  @@unique([employeeId, responseDate])
+  @@index([responseDate])
+}
+
+/// A single answer to a single daily question.
+model DailyQuestionAnswer {
+  id           String   @id @default(cuid())
+  responseId   String
+  employeeId   String
+  questionId   String
+  /// Denormalised from the parent submission so date-based analytics do not
+  /// have to join through it on every query.
+  responseDate DateTime
+  /// RATING: 1-5. YES_NO: 1/0. Null for the other two types.
+  numericValue Float?
+  textValue    String?
+  /// JSON array of chosen labels for MULTIPLE_CHOICE.
+  selectedOptionsJson String?
+  createdAt    DateTime @default(now())
+
+  response DailyQuestionResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  question DailyQuestion          @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  employee Employee               @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([responseId, questionId])
+  @@index([employeeId, responseDate])
+  @@index([questionId])
+}
+
+/// Employee-authored written feedback from the daily pulse. Attributed by
+/// design: the employee can see and manage their own submissions.
+model EmployeeFeedback {
+  id          String   @id @default(cuid())
+  employeeId  String
+  /// Free category, e.g. "SUGGESTION" or "WORK_ISSUE".
+  category    String
+  /// The employee's own words. Never rewritten or summarised in place.
+  content     String
+  isAnonymous Boolean  @default(false)
+  status      String   @default("SUBMITTED")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([employeeId, createdAt])
+  @@index([category])
+}
+
+/// Anonymous written feedback.
+///
+/// Intentionally a separate table with no foreign key to `Employee`. Sharing a
+/// table with attributed feedback and nulling the id would leave an anonymity
+/// guarantee that depends on every future query remembering to exclude a row;
+/// here there is no join to leak. The only per-employee record is
+/// `FeedbackHistory`, which is written once at submission and is never
+/// queryable as feedback content.
+model AnonymousFeedback {
+  id         String   @id @default(cuid())
+  category   String
+  content    String
+  /// Category chosen by the employee. Retained because it is not identifying.
+  status     String   @default("SUBMITTED")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([category])
+  @@index([createdAt])
+}
+
+/// Append-only record that an employee submitted on a given day.
+///
+/// This is the internal link between an anonymous submission and its author.
+/// It exists so HR can report participation ("42 of 50 submitted") without
+/// exposing who said what, and it is deliberately write-once: `update` is not
+/// exposed, so the record cannot be used to walk anonymous feedback back to an
+/// author.
+model FeedbackHistory {
+  id            String   @id @default(cuid())
+  employeeId    String
+  /// UTC calendar day of the submission.
+  feedbackDate  DateTime
+  source        String   @default("DAILY_PULSE")
+  /// True when the employee also submitted anonymous feedback that day.
+  hasAnonymous  Boolean  @default(false)
+  questionCount Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, feedbackDate])
+  @@index([feedbackDate])
+}
+
+/// One computed engagement score per employee per day.
+///
+/// A daily score answers a different question from `EngagementScore`, which is
+/// a monthly roll-up: it is derived from that day's five answers plus the
+/// employee's written-feedback sentiment and their recent trajectory, so it
+/// needs its own table rather than a period string that would collide with the
+/// monthly unique key.
+model DailyEngagementScore {
+  id                String   @id @default(cuid())
+  employeeId        String
+  scoreDate         DateTime
+  /// [0, 100]
+  overallScore      Float
+  /// The five answers, normalised to [0, 100]. Null when unanswered.
+  questionScore     Float?
+  /// Written-feedback sentiment for the day, [0, 100]. Null when none.
+  feedbackScore     Float?
+  /// Weighted mean of the recent daily scores, [0, 100]. Null on the first day.
+  trendScore        Float?
+  /// Explicit list of which inputs were present, so the UI can show why.
+  method            String   @default("DAILY_V1")
+  createdAt         DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, scoreDate])
+  @@index([scoreDate])
+}
+
+/// A generated observation about a team or organisation over a date range.
+///
+/// Each row stores the figures it was derived from (`evidenceJson`) so a user
+/// can check the claim, and `evidenceSize` so an insight built from too few
+/// responses is not presented as a finding.
+model AiInsight {
+  id            String   @id @default(cuid())
+  /// ANALYTICS_LEVEL, except EMPLOYEE-level insights are not generated.
+  level         String
+  /// Team id, department id, or 'ALL'.
+  targetKey     String
+  targetName    String
+  /// InsightType.
+  insightType   String
+  /// ANALYTICS_DIMENSION the insight is about, or 'ENGAGEMENT'.
+  subject       String
+  headline      String
+  detail        String
+  /// Direction of change: UP | DOWN | FLAT.
+  direction     String   @default("FLAT")
+  severity      String   @default("INFO") // InsightSeverity
+  /// The comparison the claim rests on, e.g. {"from": 62, "to": 71}.
+  evidenceJson  String
+  /// Number of records behind the claim. Insights below the threshold are not
+  /// written at all, so this is always >= the minimum.
+  evidenceSize  Int
+  windowStart   DateTime
+  windowEnd     DateTime
+  isDismissed   Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  @@index([level, targetKey, createdAt])
+  @@index([windowStart])
+}
