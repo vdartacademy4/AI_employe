@@ -7,10 +7,12 @@ import {
   dateQuerySchema,
   listFeedbackQuerySchema,
   listQuestionSetsQuerySchema,
+  rangeQuerySchema,
   submitDailySchema,
   updatePulseConfigSchema,
   updateQuestionSchema,
 } from './daily-pulse.schemas';
+import { TREND_RANGE_DAYS } from './daily-pulse.schemas';
 import { dailyPulseService, startOfUtcDay } from './daily-pulse.service';
 import { feedbackInboxService } from './feedback-inbox.service';
 import { dashboardsService } from './dashboards.service';
@@ -63,10 +65,38 @@ export const dailyPulseController = {
     res.status(200).json({ data });
   }),
 
-  /** Recent sets with their source, so rotation and fallback are auditable. */
+  /** Recent sets with their source, so rotation is auditable. */
   questionSets: asyncHandler(async (req: Request, res: Response) => {
     const { limit } = listQuestionSetsQuerySchema.parse(req.query);
     const data = await dailyPulseService.recentQuestionSets(req.user!, limit);
+    res.status(200).json({ data });
+  }),
+
+  /** The 20-question bank, read-only, as the fixed list is defined. */
+  questionBank: asyncHandler(async (req: Request, res: Response) => {
+    const data = await dailyPulseService.listQuestions(req.user!);
+    res.status(200).json({ data });
+  }),
+
+  /**
+   * How each question was answered over a date range.
+   *
+   * Grouped by the wording stored on the answer, so a question keeps one
+   * continuous series across the rotation rather than fragmenting into a new
+   * entry every time it comes round again.
+   */
+  questionBreakdown: asyncHandler(async (req: Request, res: Response) => {
+    const { startDate, endDate } = rangeQuerySchema.parse(req.query);
+    const range = resolveRange(startDate, endDate);
+    const data = await dailyPulseService.questionBreakdown(req.user!, range.startDate, range.endDate);
+    res.status(200).json({ data });
+  }),
+
+  /** Per-day participation and mean score across a range. */
+  trends: asyncHandler(async (req: Request, res: Response) => {
+    const { startDate, endDate } = rangeQuerySchema.parse(req.query);
+    const range = resolveRange(startDate, endDate);
+    const data = await dailyPulseService.trends(req.user!, range.startDate, range.endDate);
     res.status(200).json({ data });
   }),
 
@@ -157,3 +187,19 @@ export const dailyPulseController = {
     res.status(200).json({ data });
   }),
 };
+
+/** Resolves an optional range into UTC-midnight bounds, defaulting to the trend window. */
+function resolveRange(startDate?: Date, endDate?: Date) {
+  const end = startOfUtcDay(endDate ?? new Date());
+  const span = TREND_RANGE_DAYS * 86_400_000;
+  const start = startDate ? startOfUtcDay(startDate) : new Date(end.getTime() - span);
+
+  // An inverted or unbounded range would otherwise run to the epoch. Clamping
+  // keeps the cap honest and makes a malformed query a shorter window, not an
+  // unbounded table scan.
+  if (start > end) return { startDate: end, endDate: end };
+  if (end.getTime() - start.getTime() > span) {
+    return { startDate: new Date(end.getTime() - span), endDate: end };
+  }
+  return { startDate: start, endDate: end };
+}

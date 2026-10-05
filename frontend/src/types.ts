@@ -608,20 +608,21 @@ export interface DailyQuestionView {
 
 /** The employee's view of today's pulse. */
 export interface DailyPulseToday {
-  responseDate: string;
+responseDate: string;
   isActive: boolean;
-  allowResubmission: boolean;
-  /** False once submitted, unless HR has enabled resubmission. */
+  /** False once submitted. A day is one submission; there is no resubmission. */
   canSubmit: boolean;
   alreadySubmitted: boolean;
   questionCount: number;
   questions: DailyQuestionView[];
-submittedAt: string | null;
+  submittedAt: string | null;
   hasWrittenFeedback: boolean;
   hasAnonymousFeedback: boolean;
-  /** Whether today's questions were model-written or drawn from the curated bank. */
+  /**
+   * Provenance of the set, retained for historical sets generated before the
+   * bank was fixed. New sets are always `BANK`.
+   */
   questionSource: DailyQuestionSetSource;
-  /** The provider and model behind `questionSource`, when one was used. */
   questionSourceModel: string | null;
 }
 
@@ -779,10 +780,46 @@ export interface DailyPulseResponses {
   responses: DailyPulseResponseDetail[];
 }
 
+/**
+ * One question's results across a range.
+ *
+ * `average` and `yesShare` are null rather than zero when there is no numeric
+ * data, so the UI can say "no data" instead of implying a measured zero.
+ */
+export interface DailyQuestionBreakdownEntry {
+  prompt: string;
+  answerType: DailyAnswerType;
+  responses: number;
+  average: number | null;
+  yesShare: number | null;
+  textAnswers: number;
+  recentTexts: string[];
+}
+
+export interface DailyQuestionBreakdown {
+  startDate: string;
+  endDate: string;
+  questions: DailyQuestionBreakdownEntry[];
+}
+
+export interface DailyTrendPoint {
+  date: string;
+  submissions: number;
+  /** Null when the organisation had no eligible employees to divide by. */
+  participationRate: number | null;
+  averageScore: number | null;
+}
+
+export interface DailyTrends {
+  startDate: string;
+  endDate: string;
+  eligible: number;
+  days: DailyTrendPoint[];
+}
+
 export interface PulseConfig {
   id: string;
   questionsPerDay: number;
-  allowResubmission: boolean;
   isActive: boolean;
   opensAtHour: number;
   updatedAt: string;

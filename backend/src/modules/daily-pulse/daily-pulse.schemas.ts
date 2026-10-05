@@ -16,9 +16,8 @@ const answerSchema = z
   );
 
 /**
- * The daily submission. Exactly one request per day unless HR has enabled
- * resubmission; the service enforces that against stored state rather than
- * trusting a client flag.
+ * The daily submission. One per employee per day, enforced by the service
+ * against stored state rather than by anything the client sends.
  */
 export const submitDailySchema = z.object({
   /** Defaults to today, UTC. */
@@ -71,8 +70,12 @@ export const updateQuestionSchema = z.object({
 });
 export type UpdateQuestionInput = z.infer<typeof updateQuestionSchema>;
 
+/**
+ * Only the pause switch is configurable. `allowResubmission` was dropped from
+ * the API: a day is one submission per employee, so there is no state in which
+ * it would be honoured.
+ */
 export const updatePulseConfigSchema = z.object({
-  allowResubmission: z.boolean().optional(),
   isActive: z.boolean().optional(),
 });
 export type UpdatePulseConfigInput = z.infer<typeof updatePulseConfigSchema>;
@@ -98,3 +101,18 @@ export const listQuestionSetsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(60).default(14),
 });
 export type ListQuestionSetsQuery = z.infer<typeof listQuestionSetsQuerySchema>;
+
+/**
+ * An inclusive date range for the HR question breakdown and trend chart.
+ *
+ * Capped at 180 days so a single request cannot pull the whole history into
+ * memory; the chart reads a window, not the archive.
+ */
+export const rangeQuerySchema = z.object({
+  startDate: z.coerce.date().optional(),
+  endDate: z.coerce.date().optional(),
+});
+export type RangeQuery = z.infer<typeof rangeQuerySchema>;
+
+/** The trend window's default span, in days, when no start date is given. */
+export const TREND_RANGE_DAYS = 30;

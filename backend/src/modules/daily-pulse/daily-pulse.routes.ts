@@ -34,17 +34,37 @@ dailyPulseRouter.get(
   dailyPulseController.responses,
 );
 
+/**
+ * The same raw-feedback boundary for the aggregate views.
+ *
+ * A per-question average identifies who answered as surely as naming them does:
+ * with a handful of respondents, "the one person who rated this 1" is a name.
+ * So these take PULSE_READ_ALL, not PULSE_MANAGE, matching `/responses`.
+ */
+dailyPulseRouter.get(
+  '/trends',
+  requirePermission(PERMISSIONS.PULSE_READ_ALL),
+  dailyPulseController.trends,
+);
+dailyPulseRouter.get(
+  '/questions/breakdown',
+  requirePermission(PERMISSIONS.PULSE_READ_ALL),
+  dailyPulseController.questionBreakdown,
+);
+
 // HR/Admin configuration.
 dailyPulseRouter.get(
   '/questions',
   requirePermission(PERMISSIONS.PULSE_MANAGE),
-  dailyPulseController.listQuestions,
+  dailyPulseController.questionBank,
 );
 dailyPulseRouter.get(
   '/config',
   requirePermission(PERMISSIONS.PULSE_MANAGE),
   dailyPulseController.getConfig,
 );
+// The 20-question bank is fixed in code. These stay routed so an older client
+// gets an explanatory 400 rather than a 404, and the service refuses both.
 dailyPulseRouter.post(
   '/questions',
   requirePermission(PERMISSIONS.PULSE_MANAGE),
@@ -62,11 +82,10 @@ dailyPulseRouter.patch(
 );
 
 /**
- * The generated question sets.
+ * The daily question sets.
  *
- * Declared before `/questions/:id` would be matched only by path shape, but the
- * explicit ordering keeps the read-only views together and makes the intent
- * obvious: these describe sets, that one edits a pool row.
+ * Declared before `/questions/:id` so the read-only set views are matched on
+ * path shape rather than being swallowed by that parameterised route.
  */
 dailyPulseRouter.get(
   '/questions/set',

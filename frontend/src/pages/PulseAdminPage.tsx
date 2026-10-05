@@ -1,33 +1,39 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { PageHeader, Card, CardHeader, Button, Callout, EmptyState, LoadingState, ErrorState, Badge, Input, Textarea, Field } from '@/components/ui';
+import { PageHeader, Card, CardHeader, Button, Callout, EmptyState, LoadingState, ErrorState, Badge, Input } from '@/components/ui';
 import { dailyPulseApi } from '@/lib/api';
-import type { DailyAnswerType, DailyQuestionSet, DailyPulseResponseDetail } from '@/types';
-
-const ANSWER_TYPES: Array<{ value: DailyAnswerType; label: string; needsOptions: boolean }> = [
-  { value: 'RATING', label: 'Rating (1-5)', needsOptions: false },
-  { value: 'YES_NO', label: 'Yes / No', needsOptions: false },
-  { value: 'MULTIPLE_CHOICE', label: 'Multiple choice', needsOptions: true },
-  { value: 'SHORT_TEXT', label: 'Short text', needsOptions: false },
-];
+import type {
+  DailyQuestionBreakdownEntry,
+  DailyQuestionSet,
+  DailyPulseResponseDetail,
+  DailyTrendPoint,
+} from '@/types';
 
 /**
  * HR/Admin view of the daily pulse.
  *
- * Two things are deliberately not editable here: the five questions employees
- * answer each day, and the wording of any day already asked. Both are decided
- * by the daily rotation and frozen once written, because answers recorded
- * against a question that later changes stop meaning what they said.
+ * Three things are deliberately not editable here. The bank of 20 questions is
+ * fixed in code, so editing it would desynchronise the rotation from what
+ * employees are actually asked. The five questions of any day are decided by the
+ * rotation and frozen once written, because answers recorded against a question
+ * that later changes stop meaning what they said.
+ *
+ * The page therefore reads: today's set, who answered it, and how each question
+ * and each day has trended.
  */
 export function PulseAdminPage() {
   const queryClient = useQueryClient();
-  const [editing, setEditing] = useState<string | null>(null);
   const [viewDate, setViewDate] = useState(() => todayInputValue());
+  const [rangeStart, setRangeStart] = useState(() => daysAgoInputValue(29));
+  const [rangeEnd, setRangeEnd] = useState(() => todayInputValue());
 
-  const questions = useQuery({ queryKey: ['pulse', 'questions'], queryFn: () => dailyPulseApi.listQuestions() });
   const config = useQuery({ queryKey: ['pulse', 'config'], queryFn: () => dailyPulseApi.getConfig() });
-  const recentSets = useQuery({ queryKey: ['pulse', 'questionSets'], queryFn: () => dailyPulseApi.recentQuestionSets({ limit: 14 }) });
-  const todaysSet = useQuery({
+  const bank = useQuery({ queryKey: ['pulse', 'questions'], queryFn: () => dailyPulseApi.listQuestions() });
+  const recentSets = useQuery({
+    queryKey: ['pulse', 'questionSets'],
+    queryFn: () => dailyPulseApi.recentQuestionSets({ limit: 14 }),
+  });
+  const selectedSet = useQuery({
     queryKey: ['pulse', 'questionSet', viewDate],
     queryFn: () => dailyPulseApi.questionSet({ date: viewDate }),
   });
@@ -35,26 +41,21 @@ export function PulseAdminPage() {
     queryKey: ['pulse', 'responses', viewDate],
     queryFn: () => dailyPulseApi.responses({ date: viewDate }),
   });
-
-  const createQuestion = useMutation({
-    mutationFn: (payload: Parameters<typeof dailyPulseApi.createQuestion>[0]) =>
-      dailyPulseApi.createQuestion(payload),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['pulse'] }),
+  const breakdown = useQuery({
+    queryKey: ['pulse', 'questionBreakdown', rangeStart, rangeEnd],
+    queryFn: () => dailyPulseApi.questionBreakdown({ startDate: rangeStart, endDate: rangeEnd }),
+    enabled: Boolean(rangeStart && rangeEnd),
   });
-
-  const updateQuestion = useMutation({
-    mutationFn: ({ id, payload }: { id: string; payload: Parameters<typeof dailyPulseApi.updateQuestion>[1] }) =>
-      dailyPulseApi.updateQuestion(id, payload),
-    onSuccess: () => {
-      setEditing(null);
-      void queryClient.invalidateQueries({ queryKey: ['pulse'] });
-    },
+  const trends = useQuery({
+    queryKey: ['pulse', 'trends', rangeStart, rangeEnd],
+    queryFn: () => dailyPulseApi.trends({ startDate: rangeStart, endDate: rangeEnd }),
+    enabled: Boolean(rangeStart && rangeEnd),
   });
 
   const updateConfig = useMutation({
     mutationFn: (payload: Parameters<typeof dailyPulseApi.updateConfig>[0]) =>
       dailyPulseApi.updateConfig(payload),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['pulse'] }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['pulse', 'config'] }),
   });
 
   const regenerate = useMutation({
@@ -65,14 +66,13 @@ export function PulseAdminPage() {
     },
   });
 
-  if (questions.isLoading || config.isLoading) return <LoadingState label="Loading pulse settings" />;
-  if (questions.isError || config.isError) {
-    return <ErrorState title="Could not load pulse settings" onRetry={() => void questions.refetch()} />;
+  if (config.isLoading) return <LoadingState label="Loading pulse settings" />;
+  if (config.isError) {
+    return <ErrorState title="Could not load pulse settings" onRetry={() => void config.refetch()} />;
   }
 
-  const items = questions.data ?? [];
   const settings = config.data;
-  const todaysQuestions = todaysSet.data;
+  const responseCount = responses.data?.responses.length ?? 0;
 
   return (
     <div className="space-y-6">
@@ -84,21 +84,6 @@ export function PulseAdminPage() {
       <Card>
         <CardHeader title="Submission policy" />
         <div className="space-y-4">
-          <label className="flex items-start gap-3 text-sm text-slate-700">
-            <input
-              type="checkbox"
-              className="mt-1"
-              checked={settings?.allowResubmission ?? false}
-              onChange={(event) => updateConfig.mutate({ allowResubmission: event.target.checked })}
-            />
-            <span>
-              Allow employees to submit again the same day
-              <span className="block text-xs text-slate-500">
-                Off by default. When on, a resubmission replaces the previous answers rather than adding to them.
-              </span>
-            </span>
-          </label>
-
           <label className="flex items-start gap-3 text-sm text-slate-700">
             <input
               type="checkbox"
@@ -115,19 +100,20 @@ export function PulseAdminPage() {
           </label>
 
           <p className="text-xs text-slate-500">
-            Questions per day is fixed at {settings?.questionsPerDay ?? 5} by the product specification.
+            Each employee submits once per day. Questions per day is fixed at{' '}
+            {settings?.questionsPerDay ?? 5} by the product specification.
           </p>
         </div>
       </Card>
 
       <Card>
         <CardHeader
-          title="Today’s questions"
-          description="Prepared automatically each day: the model writes them, and the curated bank covers any outage. The same five are shown to everyone, and they do not change once asked."
+          title="The day’s questions"
+          description="Five drawn from the fixed bank of 20 and rotated daily. The same five are shown to everyone, and they do not change once asked."
           actions={
             <Button
               variant="secondary"
-              disabled={regenerate.isPending || (responses.data?.responses.length ?? 0) > 0}
+              disabled={regenerate.isPending || responseCount > 0}
               onClick={() => regenerate.mutate(viewDate)}
             >
               {regenerate.isPending ? 'Regenerating…' : 'Regenerate'}
@@ -135,14 +121,24 @@ export function PulseAdminPage() {
           }
         />
 
-        {todaysSet.isLoading ? (
+        <div className="mb-4">
+          <Input
+            type="date"
+            aria-label="Day to review"
+            value={viewDate}
+            onChange={(event) => setViewDate(event.target.value || todayInputValue())}
+            className="w-auto"
+          />
+        </div>
+
+        {selectedSet.isLoading ? (
           <LoadingState label="Loading questions" />
-        ) : todaysSet.isError ? (
-          <ErrorState title="Could not load the question set" onRetry={() => void todaysSet.refetch()} />
-        ) : !todaysQuestions ? (
+        ) : selectedSet.isError ? (
+          <ErrorState title="Could not load the question set" onRetry={() => void selectedSet.refetch()} />
+        ) : !selectedSet.data ? (
           <EmptyState title="No questions for this day" />
         ) : (
-          <SetQuestions set={todaysQuestions} />
+          <SetQuestions set={selectedSet.data} />
         )}
 
         {regenerate.isError ? (
@@ -150,10 +146,9 @@ export function PulseAdminPage() {
             {messageOf(regenerate.error)}
           </Callout>
         ) : null}
-        {(responses.data?.responses.length ?? 0) > 0 ? (
+        {responseCount > 0 ? (
           <p className="mt-3 text-xs text-slate-500">
-            {responses.data!.responses.length}{' '}
-            {responses.data!.responses.length === 1 ? 'person has' : 'people have'} already answered this
+            {responseCount} {responseCount === 1 ? 'person has' : 'people have'} already answered this
             day, so the questions are locked. Regenerating would leave their answers describing wording they
             never saw.
           </p>
@@ -164,21 +159,13 @@ export function PulseAdminPage() {
         <CardHeader
           title="Responses"
           description="Each employee’s answers to the questions above."
-          actions={
-            <Input
-              type="date"
-              value={viewDate}
-              onChange={(event) => setViewDate(event.target.value || todayInputValue())}
-              className="w-auto"
-            />
-          }
         />
 
         {responses.isLoading ? (
           <LoadingState label="Loading responses" />
         ) : responses.isError ? (
           <ErrorState title="Could not load responses" onRetry={() => void responses.refetch()} />
-        ) : (responses.data?.responses.length ?? 0) === 0 ? (
+        ) : responseCount === 0 ? (
           <EmptyState
             title="No responses for this day"
             description="Responses appear here as employees submit."
@@ -192,24 +179,56 @@ export function PulseAdminPage() {
         )}
       </Card>
 
+      <Card>
+        <CardHeader
+          title="Results by question"
+          description="Every question that collected an answer in this period, most-asked first."
+          actions={<RangePicker start={rangeStart} end={rangeEnd} onChange={setRangeStart} onEnd={setRangeEnd} />}
+        />
+
+        {breakdown.isLoading ? (
+          <LoadingState label="Loading question results" />
+        ) : breakdown.isError ? (
+          <ErrorState title="Could not load question results" onRetry={() => void breakdown.refetch()} />
+        ) : (breakdown.data?.questions.length ?? 0) === 0 ? (
+          <EmptyState
+            title="No answers in this period"
+            description="Per-question results appear here once employees start submitting."
+          />
+        ) : (
+          <ul className="divide-y divide-slate-100">
+            {breakdown.data!.questions.map((entry) => (
+              <BreakdownRow key={entry.prompt} entry={entry} />
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Trends"
+          description="Submissions and average score per day. Days with no responses are shown as gaps rather than zero."
+          actions={<RangePicker start={rangeStart} end={rangeEnd} onChange={setRangeStart} onEnd={setRangeEnd} />}
+        />
+
+        {trends.isLoading ? (
+          <LoadingState label="Loading trends" />
+        ) : trends.isError ? (
+          <ErrorState title="Could not load trends" onRetry={() => void trends.refetch()} />
+        ) : (
+          <TrendTable points={trends.data?.days ?? []} eligible={trends.data?.eligible ?? 0} />
+        )}
+      </Card>
+
       {recentSets.data && recentSets.data.length > 0 ? (
         <Card>
-          <CardHeader
-            title="Recent days"
-            description="How each day’s five questions were produced."
-          />
+          <CardHeader title="Recent days" description="The five questions asked on each recent day." />
           <ul className="divide-y divide-slate-100">
             {recentSets.data.map((set) => (
               <li key={set.id} className="flex items-center justify-between gap-3 py-3 text-sm">
                 <span className="font-medium text-slate-800">{formatDay(set.responseDate)}</span>
-                <span className="flex items-center gap-2 text-slate-500">
-                  {set.source === 'GEMINI' ? (
-                    <Badge className="bg-violet-50 text-violet-700 ring-violet-200">AI</Badge>
-                  ) : (
-                    <Badge>Question bank</Badge>
-                  )}
-                  {set.model ? <span className="text-xs">{set.model}</span> : null}
-                  {set.note ? <span className="text-xs">{set.note}</span> : null}
+                <span className="text-xs text-slate-500">
+                  {set.questions.map((question) => question.position).join(', ')} of the bank
                 </span>
               </li>
             ))}
@@ -219,90 +238,44 @@ export function PulseAdminPage() {
 
       <Card>
         <CardHeader
-          title={`Fallback question bank (${items.filter((q) => q.isActive).length} active)`}
-          description="Used to draw a day’s questions when the model is unavailable. Editing these never changes a day that has already been asked."
+          title="Question bank"
+          description="The 20 questions employees are asked, in rotation order. This list is fixed and cannot be edited."
         />
 
-        {items.length === 0 ? (
-          <EmptyState
-            title="No questions configured"
-            description="Add the first question to get the daily pulse started."
-          />
+        {bank.isLoading ? (
+          <LoadingState label="Loading the question bank" />
+        ) : bank.isError ? (
+          <ErrorState title="Could not load the question bank" onRetry={() => void bank.refetch()} />
+        ) : (bank.data?.length ?? 0) === 0 ? (
+          <EmptyState title="No questions configured" />
         ) : (
-          <ul className="divide-y divide-slate-100">
-            {items.map((question) => (
-              <li key={question.id} className="py-4">
-                {editing === question.id ? (
-                  <QuestionEditor
-                    initial={question}
-                    saving={updateQuestion.isPending}
-                    error={updateQuestion.isError ? String((updateQuestion.error as { message?: string }).message ?? '') : null}
-                    onCancel={() => setEditing(null)}
-                    onSave={(payload) => updateQuestion.mutate({ id: question.id, payload })}
-                  />
-                ) : (
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium text-slate-900">
-                          {question.position}. {question.prompt}
-                        </span>
-                        <Badge>{question.answerType.replace('_', ' ').toLowerCase()}</Badge>
-                        {!question.isActive ? <Badge>Retired</Badge> : null}
-                      </div>
-                      {question.options.length > 0 ? (
-                        <p className="mt-1 text-xs text-slate-500">Options: {question.options.join(', ')}</p>
-                      ) : null}
-                    </div>
-                    <div className="flex gap-2">
-                      <Button variant="secondary" onClick={() => setEditing(question.id)}>
-                        Edit
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        onClick={() => updateQuestion.mutate({ id: question.id, payload: { isActive: !question.isActive } })}
-                      >
-                        {question.isActive ? 'Retire' : 'Restore'}
-                      </Button>
-                    </div>
-                  </div>
-                )}
+          <ol className="divide-y divide-slate-100">
+            {bank.data!.map((question, index) => (
+              <li key={question.id} className="flex items-start gap-3 py-3 text-sm">
+                <span className="w-6 shrink-0 text-slate-400">{index + 1}.</span>
+                <span className="flex-1">
+                  <span className="text-slate-900">{question.prompt}</span>
+                  <Badge className="ml-2 align-middle">
+                    {question.answerType.replace('_', ' ').toLowerCase()}
+                  </Badge>
+                </span>
               </li>
             ))}
-          </ul>
+          </ol>
         )}
-      </Card>
-
-      <Card>
-        <CardHeader
-          title="Add a bank question"
-          description="Takes the next free slot in the fallback pool, not in today’s set."
-        />
-        <QuestionEditor
-          saving={createQuestion.isPending}
-          error={createQuestion.isError ? String((createQuestion.error as { message?: string }).message ?? '') : null}
-          nextPosition={nextFreePosition(items.map((q) => q.position))}
-          onSave={(payload) => createQuestion.mutate(payload)}
-        />
       </Card>
     </div>
   );
 }
 
-/** Renders a day's five questions with their provenance. */
+/** Renders a day's five questions. */
 function SetQuestions({ set }: { set: DailyQuestionSet }) {
   return (
     <div className="space-y-4">
       <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
         <span>{formatDay(set.responseDate)}</span>
-        {set.source === 'GEMINI' ? (
-          <Badge className="bg-violet-50 text-violet-700 ring-violet-200">Written by AI</Badge>
-        ) : (
-          <Badge>Drawn from the question bank</Badge>
-        )}
-        {set.model ? <span>{set.model}</span> : null}
+        <Badge>Drawn from the question bank</Badge>
       </p>
-      {set.note ? <Callout tone="info" title="Why the bank was used">{set.note}</Callout> : null}
       <ol className="space-y-3">
         {set.questions.map((question) => (
           <li key={question.id} className="flex items-start gap-2 text-sm">
@@ -333,9 +306,7 @@ function ResponseRow({ response }: { response: DailyPulseResponseDetail }) {
           {response.employee.department ? <span>{response.employee.department}</span> : null}
           {response.employee.jobTitle ? <span>{response.employee.jobTitle}</span> : null}
           <span>{formatTime(response.submittedAt)}</span>
-          {response.summaryValue !== null ? (
-            <Badge>Average {response.summaryValue}</Badge>
-          ) : null}
+          {response.summaryValue !== null ? <Badge>Average {response.summaryValue}</Badge> : null}
         </span>
       </div>
       <dl className="mt-2 space-y-1">
@@ -347,6 +318,125 @@ function ResponseRow({ response }: { response: DailyPulseResponseDetail }) {
         ))}
       </dl>
     </li>
+  );
+}
+
+/** One question's results over the period. */
+function BreakdownRow({ entry }: { entry: DailyQuestionBreakdownEntry }) {
+  return (
+    <li className="py-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <p className="flex-1 text-sm font-medium text-slate-900">{entry.prompt}</p>
+        <span className="flex shrink-0 items-center gap-2 text-xs text-slate-500">
+          <Badge>{entry.answerType.replace('_', ' ').toLowerCase()}</Badge>
+          <Badge>{entry.responses} answered</Badge>
+        </span>
+      </div>
+      <p className="mt-1 flex flex-wrap items-center gap-3 text-sm text-slate-600">
+        {entry.average !== null ? <span>Average {entry.average}</span> : <span>No numeric answers</span>}
+        {entry.yesShare !== null ? <span>{entry.yesShare}% answered yes</span> : null}
+        {entry.textAnswers > 0 ? <span>{entry.textAnswers} written</span> : null}
+      </p>
+      {entry.recentTexts.length > 0 ? (
+        <ul className="mt-2 space-y-1 border-l-2 border-slate-100 pl-3">
+          {entry.recentTexts.map((text, index) => (
+            <li key={index} className="text-sm italic text-slate-600">
+              “{text}”
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </li>
+  );
+}
+
+/**
+ * The daily series as a table.
+ *
+ * A table rather than a chart: with at most 30 rows and no charting library in
+ * the project, it shows the exact per-day numbers, and the gaps stay visible.
+ */
+function TrendTable({ points, eligible }: { points: DailyTrendPoint[]; eligible: number }) {
+  if (points.length === 0) {
+    return <EmptyState title="No days in this period" description="Widen the date range to see trends." />;
+  }
+
+  const best = points.reduce<DailyTrendPoint | null>((top, point) => {
+    if (point.averageScore === null) return top;
+    if (top === null || top.averageScore === null || point.averageScore > top.averageScore) return point;
+    return top;
+  }, null);
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-slate-500">
+        {eligible} active {eligible === 1 ? 'employee' : 'employees'} eligible to respond.
+        {best?.averageScore !== null && best ? (
+          <>
+            {' '}
+            Best day {formatDay(best.date)} at {best.averageScore}.
+          </>
+        ) : null}
+      </p>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500">
+            <th scope="col" className="py-2">Day</th>
+            <th scope="col" className="py-2">Submissions</th>
+            <th scope="col" className="py-2">Participation</th>
+            <th scope="col" className="py-2">Average score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {points.map((point) => (
+            <tr key={point.date} className="border-b border-slate-100 last:border-0">
+              <td className="py-2 text-slate-700">{formatDay(point.date)}</td>
+              <td className="py-2 text-slate-700">{point.submissions}</td>
+              <td className="py-2 text-slate-700">
+                {/* A dash, not a zero: nobody answering is not the same as a measured 0%. */}
+                {point.participationRate !== null ? `${point.participationRate}%` : '—'}
+              </td>
+              <td className="py-2 text-slate-700">
+                {point.averageScore !== null ? point.averageScore : '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Two date inputs bounding a period. */
+function RangePicker({
+  start,
+  end,
+  onChange,
+  onEnd,
+}: {
+  start: string;
+  end: string;
+  onChange: (value: string) => void;
+  onEnd: (value: string) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        type="date"
+        aria-label="Period start"
+        value={start}
+        onChange={(event) => onChange(event.target.value)}
+        className="w-auto"
+      />
+      <span className="text-xs text-slate-400">to</span>
+      <Input
+        type="date"
+        aria-label="Period end"
+        value={end}
+        onChange={(event) => onEnd(event.target.value)}
+        className="w-auto"
+      />
+    </div>
   );
 }
 
@@ -362,16 +452,16 @@ function formatAnswer(answer: {
 }
 
 const TOPIC_LABELS: Record<string, string> = {
-  WORKLOAD: 'Workload',
-  WORK_LIFE_BALANCE: 'Work-life balance',
-  MANAGER_SUPPORT: 'Manager support',
-  TEAMWORK: 'Teamwork',
-  COMMUNICATION: 'Communication',
-  RECOGNITION: 'Recognition',
-  GROWTH: 'Growth',
-  ENGAGEMENT: 'Engagement',
   SATISFACTION: 'Satisfaction',
-  OVERALL_EXPERIENCE: 'Overall',
+  ENGAGEMENT: 'Engagement',
+  WORKLOAD: 'Workload',
+  MOTIVATION: 'Motivation',
+  MANAGER_SUPPORT: 'Manager support',
+  WORK_ENVIRONMENT: 'Work environment',
+  STRESS: 'Stress',
+  COLLABORATION: 'Collaboration',
+  RECOGNITION: 'Recognition',
+  OVERALL_EXPERIENCE: 'Overall experience',
 };
 
 function topicLabel(topic: string): string {
@@ -395,146 +485,16 @@ function todayInputValue(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** `days` ago as a `yyyy-mm-dd` value, for the default trend period. */
+function daysAgoInputValue(days: number): string {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - days);
+  return date.toISOString().slice(0, 10);
+}
+
 function messageOf(error: unknown): string {
   if (error && typeof error === 'object' && 'message' in error) {
     return String((error as { message: unknown }).message);
   }
   return 'Please try again.';
-}
-
-function QuestionEditor({
-  initial,
-  nextPosition,
-  saving,
-  error,
-  onSave,
-  onCancel,
-}: {
-  initial?: {
-    id: string;
-    prompt: string;
-    answerType: string;
-    options: string[];
-    helpText: string | null;
-    position: number;
-  };
-  nextPosition?: number;
-  saving: boolean;
-  error: string | null;
-  onSave: (payload: {
-    prompt: string;
-    answerType: string;
-    options?: string[];
-    helpText?: string;
-    position: number;
-  }) => void;
-  onCancel?: () => void;
-}) {
-  const [prompt, setPrompt] = useState(initial?.prompt ?? '');
-  const [answerType, setAnswerType] = useState(initial?.answerType ?? 'RATING');
-  const [options, setOptions] = useState((initial?.options ?? []).join(', '));
-  const [helpText, setHelpText] = useState(initial?.helpText ?? '');
-  const [position, setPosition] = useState(initial?.position ?? nextPosition ?? 1);
-
-  const needsOptions = answerType === 'MULTIPLE_CHOICE';
-  const valid = prompt.trim().length >= 5;
-
-  return (
-    <div className="space-y-4">
-      <Field label="Question" htmlFor={`prompt-${initial?.id ?? 'new'}`}>
-        <Input
-          id={`prompt-${initial?.id ?? 'new'}`}
-          value={prompt}
-          maxLength={500}
-          placeholder="How are you feeling about your workload today?"
-          onChange={(event) => setPrompt(event.target.value)}
-        />
-      </Field>
-
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field label="Answer type" htmlFor={`type-${initial?.id ?? 'new'}`}>
-          <select
-            id={`type-${initial?.id ?? 'new'}`}
-            className="input"
-            value={answerType}
-            onChange={(event) => setAnswerType(event.target.value)}
-          >
-            {ANSWER_TYPES.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </Field>
-
-        <Field label="Position" htmlFor={`position-${initial?.id ?? 'new'}`} hint="1-5, unique.">
-          <Input
-            id={`position-${initial?.id ?? 'new'}`}
-            type="number"
-            min={1}
-            max={5}
-            value={position}
-            onChange={(event) => setPosition(Number(event.target.value))}
-          />
-        </Field>
-      </div>
-
-      {needsOptions ? (
-        <Field
-          label="Options"
-          htmlFor={`options-${initial?.id ?? 'new'}`}
-          hint="Comma separated, e.g. Blocked, Slow, Missing access"
-        >
-          <Input
-            id={`options-${initial?.id ?? 'new'}`}
-            value={options}
-            onChange={(event) => setOptions(event.target.value)}
-          />
-        </Field>
-      ) : null}
-
-      <Field label="Help text (optional)" htmlFor={`help-${initial?.id ?? 'new'}`}>
-        <Textarea
-          id={`help-${initial?.id ?? 'new'}`}
-          rows={2}
-          value={helpText}
-          maxLength={500}
-          onChange={(event) => setHelpText(event.target.value)}
-        />
-      </Field>
-
-      {error ? <Callout tone="danger" title="Could not save">{error}</Callout> : null}
-
-      <div className="flex justify-end gap-2">
-        {onCancel ? (
-          <Button variant="ghost" onClick={onCancel}>
-            Cancel
-          </Button>
-        ) : null}
-        <Button
-          disabled={!valid || saving}
-          onClick={() =>
-            onSave({
-              prompt: prompt.trim(),
-              answerType,
-              ...(needsOptions && options.trim()
-                ? { options: options.split(',').map((option) => option.trim()).filter(Boolean) }
-                : {}),
-              ...(helpText.trim() ? { helpText: helpText.trim() } : {}),
-              position,
-            })
-          }
-        >
-          {saving ? 'Saving…' : 'Save question'}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-function nextFreePosition(used: number[]): number {
-  for (let position = 1; position <= 5; position += 1) {
-    if (!used.includes(position)) return position;
-  }
-  return 1;
 }

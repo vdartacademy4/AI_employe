@@ -57,6 +57,8 @@ import type {
   DashboardSummary,
   DailyQuestionSet,
   DailyPulseResponses,
+  DailyQuestionBreakdown,
+  DailyTrends,
   PulseQuestionAdmin,
   PulseConfig,
 } from '@/types';
@@ -529,8 +531,16 @@ export const dailyPulseApi = {
 
   getConfig: () => request<PulseConfig>('/daily-pulse/config'),
 
-  updateConfig: (payload: { allowResubmission?: boolean; isActive?: boolean }) =>
+  updateConfig: (payload: { isActive?: boolean }) =>
     request<PulseConfig>('/daily-pulse/config', { method: 'PATCH', body: payload }),
+
+  /** Per-question results across a date range. HR/Admin only. */
+  questionBreakdown: (params?: { startDate?: string; endDate?: string }) =>
+    request<DailyQuestionBreakdown>('/daily-pulse/questions/breakdown', { query: params }),
+
+  /** Per-day participation and mean score across a date range. HR/Admin only. */
+  trends: (params?: { startDate?: string; endDate?: string }) =>
+    request<DailyTrends>('/daily-pulse/trends', { query: params }),
 
   /** Every employee's answers to one day's frozen set. HR/Admin only. */
   responses: (params?: { date?: string }) =>

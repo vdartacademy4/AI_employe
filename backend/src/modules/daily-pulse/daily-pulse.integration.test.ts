@@ -170,15 +170,24 @@ beforeAll(async () => {
   });
   for (const question of set.questions) questionIds.push(question.id);
 
-  // Resubmission is off by default; the duplicate-prevention test depends on it.
+  // The pulse is active. `allowResubmission` is reset too: the column still
+  // exists, and leaving a stale true behind would mask the strict-once check.
   await prisma.dailyPulseConfig.upsert({
     where: { id: 'default' },
-    create: { id: 'default', allowResubmission: false, isActive: true },
+    create: { id: 'default', isActive: true },
     update: { allowResubmission: false, isActive: true },
   });
 });
 
 afterAll(async () => {
+  await dailyPulseService.settled();
+  await prisma.sentimentAnalysis.deleteMany({
+    where: { employeeId: { in: [employeeId, hrEmployeeId, managerEmployeeId] } },
+  });
+  // Anonymous analyses carry no employeeId, so they are matched on the source.
+  await prisma.sentimentAnalysis.deleteMany({
+    where: { sourceId: { contains: 'Test anonymous' } },
+  });
   await prisma.employee.deleteMany({ where: { id: { in: [employeeId, hrEmployeeId, managerEmployeeId] } } });
   await prisma.user.deleteMany({ where: { id: { in: [employeeUserId, hrUserId, managerUserId] } } });
   await prisma.team.deleteMany({ where: { id: teamId } });
@@ -192,12 +201,23 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  // A submission kicks off analysis and scoring without awaiting them, so a run
+  // from the previous test can still be writing. Waiting first is what makes the
+  // cleanup below actually a clean starting point.
+  await dailyPulseService.settled();
+
   // Reset per-test state so ordering cannot affect the duplicate test.
   await prisma.dailyQuestionResponse.deleteMany({ where: { employeeId } });
   await prisma.dailyQuestionAnswer.deleteMany({ where: { employeeId } });
   await prisma.feedbackHistory.deleteMany({ where: { employeeId } });
   await prisma.employeeFeedback.deleteMany({ where: { employeeId } });
   await prisma.dailyEngagementScore.deleteMany({ where: { employeeId } });
+  // Sentiment rows hang off the source text, not a foreign key to the employee,
+  // so deleting the feedback that produced them does not remove them. Left
+  // behind they would feed a later test's feedback score.
+  await prisma.sentimentAnalysis.deleteMany({
+    where: { OR: [{ employeeId: employeeId }, { employeeId: hrEmployeeId }] },
+  });
   await prisma.anonymousFeedback.deleteMany({ where: { content: { startsWith: 'Test anonymous' } } });
   await prisma.dailyPulseConfig.update({
     where: { id: 'default' },
@@ -232,25 +252,47 @@ describe('daily pulse submission', () => {
     );
   });
 
-  it('allows a resubmission once HR enables it', async () => {
-    await dailyPulseService.submit(employeeUser, submission());
+  it('refuses a second submission even when the legacy resubmission flag is set', async () => {
+    // The flag column survives in the schema, so a stale row can still say
+    // true. It must not reopen the day: the first answer is the one the
+    // employee actually gave.
     await prisma.dailyPulseConfig.update({
       where: { id: 'default' },
       data: { allowResubmission: true },
     });
+    try {
+      await dailyPulseService.submit(employeeUser, submission());
+      await expect(
+        dailyPulseService.submit(
+          employeeUser,
+          submission({ answers: questionIds.map((questionId) => ({ questionId, numericValue: 2 })) }),
+        ),
+      ).rejects.toThrow(/already submitted/i);
 
-    const result = await dailyPulseService.submit(
-      employeeUser,
-      submission({
-        answers: questionIds.map((questionId) => ({ questionId, numericValue: 2 })),
-      }),
-    );
-    expect(result.answerCount).toBe(5);
+      const answers = await prisma.dailyQuestionAnswer.findMany({ where: { employeeId } });
+      expect(answers).toHaveLength(5);
+      expect(answers.every((answer) => answer.numericValue === 4)).toBe(true);
+    } finally {
+      await prisma.dailyPulseConfig.update({
+        where: { id: 'default' },
+        data: { allowResubmission: false },
+      });
+    }
+  });
 
-    // The replacement is not an accumulation: still five answers in total.
-    const answers = await prisma.dailyQuestionAnswer.findMany({ where: { employeeId } });
+  it('stores the question wording on every answer row', async () => {
+    // The answer row is permanent history, so it carries its own copy of the
+    // prompt rather than resolving it through a question row that could change.
+    await dailyPulseService.submit(employeeUser, submission());
+
+    const answers = await prisma.dailyQuestionAnswer.findMany({
+      where: { employeeId },
+      orderBy: { questionId: 'asc' },
+    });
     expect(answers).toHaveLength(5);
-    expect(answers.every((answer) => answer.numericValue === 2)).toBe(true);
+    expect(answers.map((answer) => answer.questionText).sort()).toEqual(
+      Array.from({ length: 5 }, (_, index) => `Test question ${index + 1}`).sort(),
+    );
   });
 
   it('rejects a partial submission', async () => {
@@ -348,6 +390,139 @@ describe('anonymous feedback', () => {
     const mine = await feedbackInboxService.myFeedback(employeeUser);
     expect(mine.anonymous).toHaveLength(1);
     expect(mine.anonymous[0]).not.toHaveProperty('content');
+  });
+});
+
+describe('HR question breakdown', () => {
+  it('averages each question and reports the most-asked first', async () => {
+    await dailyPulseService.submit(employeeUser, submission());
+
+    const breakdown = await dailyPulseService.questionBreakdown(hrUser, today, today);
+    expect(breakdown.questions).toHaveLength(5);
+    expect(breakdown.questions.every((question) => question.responses === 1)).toBe(true);
+    expect(breakdown.questions.every((question) => question.average === 4)).toBe(true);
+    expect(breakdown.questions.map((question) => question.prompt).sort()).toEqual(
+      Array.from({ length: 5 }, (_, index) => `Test question ${index + 1}`).sort(),
+    );
+  });
+
+  it('groups by wording, not by question id', async () => {
+    // A question that comes round again gets a fresh DailyQuestion row but the
+    // same wording. Its history has to stay in one series.
+    await dailyPulseService.submit(employeeUser, submission());
+
+    const later = new Date(today.getTime() + 86_400_000);
+    const repeatSet = await prisma.dailyQuestionSet.create({
+      data: {
+        responseDate: later,
+        source: 'BANK',
+        questions: {
+          create: Array.from({ length: 5 }, (_, index) => ({
+            prompt: `Test question ${index + 1}`,
+            position: index + 1,
+            answerType: 'RATING',
+          })),
+        },
+      },
+      include: { questions: { orderBy: { position: 'asc' } } },
+    });
+
+    // The HR employee answers the repeated wording on a later day, directly,
+    // so the second occurrence gets its own question ids but shares the prompts.
+    const response = await prisma.dailyQuestionResponse.create({
+      data: {
+        employeeId: hrEmployeeId,
+        responseDate: later,
+        questionId: repeatSet.questions[0]!.id,
+        summaryValue: 2,
+      },
+    });
+    await prisma.dailyQuestionAnswer.createMany({
+      data: repeatSet.questions.map((question) => ({
+        responseId: response.id,
+        employeeId: hrEmployeeId,
+        responseDate: later,
+        questionId: question.id,
+        questionText: question.prompt,
+        numericValue: 2,
+      })),
+    });
+
+    const breakdown = await dailyPulseService.questionBreakdown(hrUser, today, later);
+    expect(breakdown.questions).toHaveLength(5);
+    // Each wording now has two responses, one from each day.
+    expect(breakdown.questions.every((question) => question.responses === 2)).toBe(true);
+    expect(breakdown.questions.every((question) => question.average === 3)).toBe(true);
+
+    await prisma.dailyQuestionAnswer.deleteMany({ where: { employeeId: hrEmployeeId, responseDate: later } });
+    await prisma.dailyQuestionResponse.deleteMany({ where: { employeeId: hrEmployeeId, responseDate: later } });
+    await prisma.dailyQuestionSet.deleteMany({ where: { responseDate: later } });
+  });
+
+  it('refuses a manager', async () => {
+    await expect(
+      dailyPulseService.questionBreakdown(managerUser, today, today),
+    ).rejects.toThrow(/not allowed to view daily responses/i);
+  });
+});
+
+describe('HR trends', () => {
+  it('reports a dense series and leaves days without responses null', async () => {
+    await dailyPulseService.submit(employeeUser, submission());
+    await storeDailyScore(employeeId, today);
+
+    const start = new Date(today.getTime() - 4 * 86_400_000);
+    const trends = await dailyPulseService.trends(hrUser, start, today);
+
+    // Five days inclusive, every day present so a gap renders as a gap.
+    expect(trends.days).toHaveLength(5);
+    expect(trends.days.map((day) => day.date)).toEqual([
+      start.toISOString().slice(0, 10),
+      new Date(start.getTime() + 86_400_000).toISOString().slice(0, 10),
+      new Date(start.getTime() + 2 * 86_400_000).toISOString().slice(0, 10),
+      new Date(start.getTime() + 3 * 86_400_000).toISOString().slice(0, 10),
+      today.toISOString().slice(0, 10),
+    ]);
+
+    const last = trends.days[trends.days.length - 1]!;
+    expect(last.submissions).toBe(1);
+    expect(last.averageScore).toBeCloseTo(75, 0);
+    // The four earlier days had no responses: null, not zero.
+    expect(trends.days.slice(0, 4).every((day) => day.submissions === 0)).toBe(true);
+    expect(trends.days.slice(0, 4).every((day) => day.averageScore === null)).toBe(true);
+  });
+
+  it('refuses a manager', async () => {
+    await expect(dailyPulseService.trends(managerUser, today, today)).rejects.toThrow(
+      /not allowed to view daily responses/i,
+    );
+  });
+});
+
+describe('fixed question bank', () => {
+  it('exposes exactly 20 fixed questions to HR', async () => {
+    const bank = await dailyPulseService.listQuestions(hrUser);
+    expect(bank).toHaveLength(20);
+    expect(new Set(bank.map((question) => question.prompt)).size).toBe(20);
+  });
+
+  it('refuses to add or edit a bank question', async () => {
+    await expect(
+      dailyPulseService.createQuestion(hrUser, {
+        prompt: 'A twenty-first question',
+        position: 1,
+        answerType: 'RATING',
+      } as never),
+    ).rejects.toThrow(/fixed at 20 questions/i);
+    await expect(
+      dailyPulseService.updateQuestion(hrUser, 'anything', { prompt: 'Reworded' } as never),
+    ).rejects.toThrow(/fixed at 20 questions/i);
+  });
+
+  it('refuses the bank endpoints to an employee', async () => {
+    await expect(dailyPulseService.listQuestions(employeeUser)).rejects.toThrow(
+      /Only HR or Admin/i,
+    );
   });
 });
 

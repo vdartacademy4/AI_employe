@@ -37,6 +37,14 @@ export function DailyFeedbackPage() {
   const [written, setWritten] = useState({ category: 'GENERAL', content: '' });
   const [anonymous, setAnonymous] = useState({ category: 'CONCERN', content: '' });
   const [includeAnonymous, setIncludeAnonymous] = useState(false);
+  /**
+   * The exact confirmation shown after a successful submission.
+   *
+   * Held as state rather than inferred from `alreadySubmitted`, so the message
+   * appears once on submission instead of being permanently true the next time
+   * the page is opened on a day already answered.
+   */
+  const [confirmation, setConfirmation] = useState<string | null>(null);
 
   const todayQuery = useQuery({ queryKey: ['pulse', 'today'], queryFn: () => dailyPulseApi.today() });
   const historyQuery = useQuery({ queryKey: ['pulse', 'history'], queryFn: () => dailyPulseApi.myHistory() });
@@ -55,6 +63,7 @@ export function DailyFeedbackPage() {
       setWritten({ category: 'GENERAL', content: '' });
       setAnonymous({ category: 'CONCERN', content: '' });
       setIncludeAnonymous(false);
+      setConfirmation("Today's feedback submitted successfully.");
       void queryClient.invalidateQueries({ queryKey: ['pulse'] });
       void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
     },
@@ -92,9 +101,7 @@ export function DailyFeedbackPage() {
       />
 
       <p className="text-xs text-slate-500">
-        {today.questionSource === 'GEMINI'
-          ? `These questions were written today${today.questionSourceModel ? ` by ${today.questionSourceModel}` : ' by AI'}.`
-          : 'These questions come from the curated HR question bank.'}
+        These five questions come from the fixed bank of 20 and rotate daily.
       </p>
 
       {!today.isActive ? (
@@ -103,15 +110,13 @@ export function DailyFeedbackPage() {
         </Callout>
       ) : null}
 
-      {today.alreadySubmitted && !today.allowResubmission ? (
+      {confirmation ? (
+        <Callout tone="success" title="Feedback submitted">
+          {confirmation} You can see your score and history on the dashboard.
+        </Callout>
+      ) : today.alreadySubmitted ? (
         <Callout tone="success" title="Thanks — your feedback is in">
           You have already answered today&rsquo;s questions. You can see your score and history on the dashboard.
-        </Callout>
-      ) : null}
-
-      {today.alreadySubmitted && today.allowResubmission ? (
-        <Callout tone="info" title="Resubmission is open">
-          HR has allowed another submission today. Your earlier answers will be replaced.
         </Callout>
       ) : null}
 

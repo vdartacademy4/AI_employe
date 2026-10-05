@@ -148,9 +148,7 @@ export function DashboardPage() {
               <div>
                 <p className="text-sm font-medium text-slate-900">Today&rsquo;s feedback is submitted</p>
                 <p className="mt-0.5 text-sm text-slate-600">
-                  {pulseTodayQuery.data.allowResubmission
-                    ? 'Resubmission is open, so you can replace your answers until the day ends.'
-                    : 'Thanks — your score and history update on your dashboard.'}
+                  Thanks — your score and history update on your dashboard.
                 </p>
               </div>
             </div>

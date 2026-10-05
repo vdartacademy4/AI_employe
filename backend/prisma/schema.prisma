@@ -854,6 +854,14 @@ model DailyQuestionAnswer {
   responseId   String
   employeeId   String
   questionId   String
+  /// The wording as it was on the day it was answered.
+  ///
+  /// Denormalised deliberately: a response is permanent history, and reading
+  /// what somebody actually saw must not depend on a question row still being
+  /// present or unchanged. The daily sets are frozen, so this is normally equal
+  /// to `question.prompt` - the copy is what makes that guarantee permanent
+  /// rather than incidental.
+  questionText String
   /// Denormalised from the parent submission so date-based analytics do not
   /// have to join through it on every query.
   responseDate DateTime

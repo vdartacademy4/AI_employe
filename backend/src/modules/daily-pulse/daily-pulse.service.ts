@@ -6,7 +6,8 @@ import { PERMISSIONS, roleHasPermission } from '../auth/permissions';
 import { AnalysisPipeline } from '../intelligence/analysis.pipeline';
 import type { AuthenticatedUser } from '../../types/express';
 import { storeDailyScore } from './daily-score.calculator';
-import { dailyQuestionGenerator, type DailySetView } from './daily-question.generator';
+import { DailyQuestionGenerator, type DailySetView } from './daily-question.generator';
+import { QUESTIONS_PER_DAY, QUESTION_BANK } from './question-bank';
 import type { SubmitDailyInput, UpdatePulseConfigInput, UpdateQuestionInput } from './daily-pulse.schemas';
 
 /** UTC midnight for the given date. Every daily row is keyed on this value. */
@@ -19,8 +20,7 @@ export function nextDay(day: Date): Date {
   return new Date(day.getTime() + 24 * 60 * 60 * 1000);
 }
 
-/** The number of questions an employee sees, fixed by product spec. */
-export const QUESTIONS_PER_DAY = 5;
+const dailyQuestionGenerator = new DailyQuestionGenerator();
 
 /** How many recent daily scores form the trend component. */
 const TREND_WINDOW_DAYS = 7;
@@ -68,6 +68,18 @@ export class DailyPulseService {
     return prisma.dailyPulseConfig.create({ data: { id: 'default' } });
   }
 
+  /**
+   * Throws unless the caller may read individual answers.
+   *
+   * The same key `responses` requires, so every HR read of real feedback goes
+   * through one check: `responses`, `questionBreakdown`, and `trends`.
+   */
+  assertCanReadResponses(user: AuthenticatedUser): void {
+    if (!roleHasPermission(user.role, PERMISSIONS.PULSE_READ_ALL)) {
+      throw new ForbiddenError('You are not allowed to view daily responses');
+    }
+  }
+
   /** Throws unless the caller may configure the five questions. */
   assertCanConfigure(user: AuthenticatedUser): void {
     const role = user.role;
@@ -111,8 +123,7 @@ export class DailyPulseService {
     return {
       responseDate: responseDate.toISOString(),
       isActive: config.isActive,
-      allowResubmission: config.allowResubmission,
-      canSubmit: config.isActive && (!existing || config.allowResubmission),
+      canSubmit: config.isActive && !existing,
       alreadySubmitted: Boolean(existing),
       questionCount: questions.length,
       questions: questions.map((question) => toQuestionView(question, existing?.answers ?? [])),
@@ -188,7 +199,11 @@ export class DailyPulseService {
       select: { id: true },
     });
 
-    if (alreadySubmitted && !config.allowResubmission) {
+    // One submission per employee per day, unconditionally. A second attempt is
+    // refused rather than overwriting the first: the earlier answer is the one
+    // that was actually given, and silently replacing it would mean the stored
+    // history disagreed with what the employee remembers submitting.
+    if (alreadySubmitted) {
       throw new ConflictError('You have already submitted feedback for today');
     }
 
@@ -201,30 +216,28 @@ export class DailyPulseService {
 
     try {
       return await prisma.$transaction(async (tx) => {
-        await tx.dailyQuestionResponse.upsert({
-          where: { employeeId_responseDate: { employeeId: employee.id, responseDate } },
-          create: {
+        // A plain create, not an upsert. The unique constraint on
+        // (employeeId, responseDate) is the race guard: if a second submission
+        // lands between the check above and here, this is the line that fails.
+        const submission = await tx.dailyQuestionResponse.create({
+          data: {
             employeeId: employee.id,
             responseDate,
             questionId: anchorQuestionId,
             summaryValue: meanNumeric(input.answers),
           },
-          update: { summaryValue: meanNumeric(input.answers) },
-        });
-
-        const submission = await tx.dailyQuestionResponse.findUniqueOrThrow({
-          where: { employeeId_responseDate: { employeeId: employee.id, responseDate } },
           select: { id: true },
         });
 
-        // Per-question answers replace the previous set on a resubmission.
-        await tx.dailyQuestionAnswer.deleteMany({ where: { responseId: submission.id } });
         await tx.dailyQuestionAnswer.createMany({
+          // The prompt is copied from the set, not joined later: this row is
+          // permanent history and has to keep saying what the employee saw.
           data: input.answers.map((answer) => ({
             responseId: submission.id,
             employeeId: employee.id,
             responseDate,
             questionId: answer.questionId,
+            questionText: byId.get(answer.questionId)!.prompt,
             numericValue: answer.numericValue ?? null,
             textValue: answer.textValue ?? null,
             selectedOptionsJson: answer.selectedOptions ? JSON.stringify(answer.selectedOptions) : null,
@@ -279,12 +292,39 @@ export class DailyPulseService {
       // inside would mean a failed NLP call rolls back a submission the
       // employee already made, which is not their problem to fix. Failures here
       // are logged and the next scheduled run picks the rows up.
-      void this.postProcess(employee.id, responseDate).catch((error: unknown) => {
+      this.trackPostProcess(employee.id, responseDate);
+    }
+  }
+
+  /** In-flight post-processing runs, so a caller can wait for them to settle. */
+  private readonly pending = new Set<Promise<void>>();
+
+  /**
+   * Starts post-processing without blocking the response.
+   *
+   * The promise is held in `pending` rather than discarded, so `settled()` can
+   * wait for it. That matters for tests and for any code that reads aggregates
+   * straight after a submission: otherwise the analysis writes race whatever
+   * cleanup or assertion runs next.
+   */
+  private trackPostProcess(employeeId: string, responseDate: Date): void {
+    const run = this.postProcess(employeeId, responseDate)
+      .catch((error: unknown) => {
         logger.error('Daily pulse post-processing failed', {
-          employeeId: employee.id,
+          employeeId,
           error: error instanceof Error ? error.message : String(error),
         });
+      })
+      .finally(() => {
+        this.pending.delete(run);
       });
+    this.pending.add(run);
+  }
+
+  /** Resolves once every in-flight post-processing run has finished. */
+  async settled(): Promise<void> {
+    while (this.pending.size > 0) {
+      await Promise.all([...this.pending]);
     }
   }
 
@@ -377,9 +417,7 @@ export class DailyPulseService {
    */
   async responses(user: AuthenticatedUser, responseDate = startOfUtcDay(new Date())) {
     const scope = await resolveScope(user);
-    if (!roleHasPermission(user.role, PERMISSIONS.PULSE_READ_ALL)) {
-      throw new ForbiddenError('You are not allowed to view daily responses');
-    }
+    this.assertCanReadResponses(user);
 
     const rows = await prisma.dailyQuestionResponse.findMany({
       where: { responseDate, employee: scope.canReadAll ? {} : { id: { in: [...scope.selfEmployeeIds] } } },
@@ -403,7 +441,10 @@ export class DailyPulseService {
             id: true,
             numericValue: true,
             textValue: true,
-            question: { select: { id: true, prompt: true, answerType: true, position: true } },
+            // The stored copy is authoritative: this is what was asked, even if
+            // the question row has since gone.
+            questionText: true,
+            question: { select: { id: true, answerType: true, position: true } },
           },
         },
       },
@@ -423,7 +464,7 @@ export class DailyPulseService {
         },
         answers: row.answers.map((answer) => ({
           questionId: answer.question.id,
-          prompt: answer.question.prompt,
+          prompt: answer.questionText,
           answerType: answer.question.answerType,
           position: answer.question.position,
           numericValue: answer.numericValue,
@@ -433,22 +474,171 @@ export class DailyPulseService {
     };
   }
 
+  /**
+   * The 20-question bank, aggregated over a date range.
+   *
+   * Answers are grouped by the wording stored on the answer row rather than by
+   * question id, so a question keeps its own history even as the rotation hands
+   * out new `DailyQuestion` rows for it. Returns one entry per question that has
+   * at least one answer in the range, so HR can see which questions are drawing
+   * the most concern and which have gone unanswered.
+   */
+  async questionBreakdown(user: AuthenticatedUser, startDate: Date, endDate: Date) {
+    this.assertCanReadResponses(user);
+
+    const answers = await prisma.dailyQuestionAnswer.findMany({
+      where: {
+        responseDate: { gte: startDate, lt: nextDay(endDate) },
+        employee: { status: { not: 'TERMINATED' } },
+      },
+      select: {
+        questionText: true,
+        numericValue: true,
+        textValue: true,
+        question: { select: { answerType: true } },
+      },
+    });
+
+    const byPrompt = new Map<
+      string,
+      {
+        prompt: string;
+        answerType: string;
+        responses: number;
+        numeric: number[];
+        texts: string[];
+      }
+    >();
+
+    for (const answer of answers) {
+      const entry = byPrompt.get(answer.questionText) ?? {
+        prompt: answer.questionText,
+        answerType: answer.question.answerType,
+        responses: 0,
+        numeric: [],
+        texts: [],
+      };
+      entry.responses += 1;
+      if (answer.numericValue !== null) entry.numeric.push(answer.numericValue);
+      if (answer.textValue) entry.texts.push(answer.textValue);
+      byPrompt.set(answer.questionText, entry);
+    }
+
+    return {
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      questions: [...byPrompt.values()]
+        .map((entry) => ({
+          prompt: entry.prompt,
+          answerType: entry.answerType,
+          responses: entry.responses,
+          /**
+           * Mean of the numeric answers. Null for a free-text question, and for
+           * a question nobody has answered numerically - which reads as "no
+           * data", not as zero.
+           */
+          average:
+            entry.numeric.length === 0
+              ? null
+              : round1(entry.numeric.reduce((sum, value) => sum + value, 0) / entry.numeric.length),
+          /** Yes share for a yes/no question, otherwise null. */
+          yesShare:
+            entry.answerType !== 'YES_NO' || entry.numeric.length === 0
+              ? null
+              : round1(entry.numeric.filter((value) => value === 1).length / entry.numeric.length),
+          textAnswers: entry.texts.length,
+          /** The most recent free-text replies, for reading alongside the numbers. */
+          recentTexts: entry.texts.slice(-3),
+        }))
+        // Most-asked first, so the questions carrying the most signal lead.
+        .sort((a, b) => b.responses - a.responses || a.prompt.localeCompare(b.prompt)),
+    };
+  }
+
+  /**
+   * Daily engagement trend across a range, for the HR trend chart.
+   *
+   * Reports per-day participation and the mean engagement score. A day with no
+   * responses is returned with `null` rather than omitted, so a gap in the
+   * series is a visible gap and not a straight line drawn through it.
+   */
+  async trends(user: AuthenticatedUser, startDate: Date, endDate: Date) {
+    this.assertCanReadResponses(user);
+
+    const [responses, scores, eligible] = await Promise.all([
+      prisma.dailyQuestionResponse.groupBy({
+        by: ['responseDate'],
+        where: {
+          responseDate: { gte: startDate, lt: nextDay(endDate) },
+          employee: { status: { not: 'TERMINATED' } },
+        },
+        _count: { id: true },
+        _avg: { summaryValue: true },
+      }),
+      prisma.dailyEngagementScore.groupBy({
+        by: ['scoreDate'],
+        where: { scoreDate: { gte: startDate, lt: nextDay(endDate) } },
+        _avg: { overallScore: true },
+        _count: { id: true },
+      }),
+      prisma.employee.count({ where: { status: { not: 'TERMINATED' } } }),
+    ]);
+
+    const responsesByDay = new Map(
+      responses.map((row) => [toDayKey(row.responseDate), row]),
+    );
+    const scoresByDay = new Map(scores.map((row) => [toDayKey(row.scoreDate), row]));
+
+    const days: Array<{
+      date: string;
+      submissions: number;
+      participationRate: number | null;
+      averageScore: number | null;
+    }> = [];
+
+    for (let day = startDate; day <= endDate; day = nextDay(day)) {
+      const key = toDayKey(day);
+      const response = responsesByDay.get(key);
+      const score = scoresByDay.get(key);
+      const submissions = response?._count.id ?? 0;
+      days.push({
+        date: key,
+        submissions,
+        participationRate:
+          eligible === 0 ? null : Math.round((submissions / eligible) * 1000) / 10,
+        averageScore:
+          score?._avg.overallScore === null || score?._avg.overallScore === undefined
+            ? null
+            : round1(score._avg.overallScore),
+      });
+    }
+
+    return { startDate: startDate.toISOString(), endDate: endDate.toISOString(), eligible, days };
+  }
+
   // --- HR/Admin configuration ---------------------------------------------
 
   /**
-   * The curated pool HR edits.
+   * The 20-question bank, read-only.
    *
-   * Scoped to `questionSetId: null` so the frozen questions of past and present
-   * days do not appear here. They are history, not configuration: editing or
-   * retiring one would desynchronise it from the answers already recorded
-   * against it.
+   * The bank lives in code rather than in a table HR can edit: the rotation is
+   * defined against these exact 20 prompts, so an editable copy could drift out
+   * of step with what the generator actually selects. This is the same list the
+   * generator draws from, exposed so HR can read what employees will be asked.
    */
   async listQuestions(user: AuthenticatedUser) {
     this.assertCanConfigure(user);
-    return prisma.dailyQuestion.findMany({
-      where: { questionSetId: null },
-      orderBy: { position: 'asc' },
-    });
+    return QUESTION_BANK.map((question, index) => ({
+      id: question.key,
+      position: index + 1,
+      prompt: question.prompt,
+      answerType: question.answerType,
+      theme: question.topic,
+      optionsJson: null,
+      helpText: null,
+      isActive: true,
+      questionSetId: null,
+    }));
   }
 
   /** The set for a date, generating it if the day has not been opened yet. */
@@ -469,66 +659,44 @@ export class DailyPulseService {
     return dailyQuestionGenerator.regenerateSet(responseDate);
   }
 
-  async createQuestion(user: AuthenticatedUser, input: Omit<UpdateQuestionInput, never> & Record<string, unknown>) {
-    this.assertCanConfigure(user);
-    return prisma.dailyQuestion.create({
-      data: {
-        prompt: input.prompt as string,
-        answerType: (input.answerType as string) ?? 'RATING',
-        optionsJson: input.options ? JSON.stringify(input.options) : null,
-        helpText: input.helpText ?? null,
-        position: input.position as number,
-        theme: typeof input.theme === 'string' ? input.theme : null,
-        isActive: input.isActive ?? true,
-      },
-    });
+  /**
+   * Refuses new bank entries.
+   *
+   * The bank is exactly 20 questions and the rotation is defined against them,
+   * so a 21st row would either never be asked or would silently displace one of
+   * the 20. Rejecting here keeps that guarantee in one place rather than
+   * depending on whoever notices the count.
+   */
+  async createQuestion(_user: AuthenticatedUser, _input: Record<string, unknown>): Promise<never> {
+    throw new ValidationError(
+      'The daily question bank is fixed at 20 questions and cannot be added to.',
+    );
   }
 
-  async updateQuestion(user: AuthenticatedUser, id: string, input: UpdateQuestionInput) {
-    this.assertCanConfigure(user);
-    const question = await prisma.dailyQuestion.findUnique({ where: { id } });
-    if (!question) throw new NotFoundError('Question not found');
-    // A question belonging to a day's frozen set is history, not configuration.
-    // Editing it would leave the stored answers describing wording nobody was
-    // ever asked, which quietly corrupts every aggregate built from them.
-    if (question.questionSetId) {
-      throw new ValidationError(
-        'This question belongs to a published daily set and cannot be edited. Edit the question bank instead.',
-      );
-    }
-
-    return prisma.dailyQuestion.update({
-      where: { id },
-      data: {
-        ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
-        ...(input.answerType !== undefined ? { answerType: input.answerType } : {}),
-        ...(input.options !== undefined
-          ? { optionsJson: input.options ? JSON.stringify(input.options) : null }
-          : {}),
-        ...(input.helpText !== undefined ? { helpText: input.helpText } : {}),
-        ...(input.position !== undefined ? { position: input.position } : {}),
-        ...(input.theme !== undefined ? { theme: input.theme ?? null } : {}),
-        ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
-      },
-    });
+  /** Refuses edits, for the same reason: the bank is fixed in code. */
+  async updateQuestion(_user: AuthenticatedUser, _id: string, _input: UpdateQuestionInput): Promise<never> {
+    throw new ValidationError(
+      'The daily question bank is fixed at 20 questions and cannot be edited.',
+    );
   }
 
+  /**
+   * Pauses or resumes the pulse.
+   *
+   * `allowResubmission` is deliberately not writable: a day is one submission
+   * per employee, so there is nothing for that setting to enable. The column
+   * stays in the schema for the existing migration history.
+   */
   async updateConfig(user: AuthenticatedUser, input: UpdatePulseConfigInput) {
     this.assertCanConfigure(user);
     return prisma.dailyPulseConfig.upsert({
       where: { id: 'default' },
       create: {
         id: 'default',
-        ...(input.allowResubmission !== undefined
-          ? { allowResubmission: input.allowResubmission }
-          : {}),
-        ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
+        isActive: input.isActive ?? true,
         updatedById: user.id,
       },
       update: {
-        ...(input.allowResubmission !== undefined
-          ? { allowResubmission: input.allowResubmission }
-          : {}),
         ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
         updatedById: user.id,
       },
@@ -630,6 +798,16 @@ function toQuestionView(
     position: question.position,
     savedAnswer: answer?.textValue ?? null,
   };
+}
+
+/** Rounds to one decimal place, matching how every other mean is reported. */
+function round1(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+/** `YYYY-MM-DD` in UTC, so map keys line up with the stored midnight dates. */
+function toDayKey(day: Date): string {
+  return day.toISOString().slice(0, 10);
 }
 
 function isUniqueViolation(error: unknown): boolean {
